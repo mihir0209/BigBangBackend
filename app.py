@@ -416,4 +416,4 @@ If you don't know the answer based on the provided information, say so honestly.
 if __name__ == '__main__':
     if not GROQ_API_KEY:
         print("WARNING: GROQ_API_KEY is not set. Please set it in app.py")
-    app.run(debug=True, port=5000)
+    app.run(host='0.0.0.0', port=5000, debug=True)
