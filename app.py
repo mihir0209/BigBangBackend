@@ -24,7 +24,10 @@ def enhance_image():
     try:
         data = request.json
         image_data = data['image']
-        method = data.get('method', 'sharpen')
+        # Fix: Map 'sharpen' to 'unsharp_mask' since that's what the ImageEnhancer expects
+        method = data.get('method', 'unsharp_mask')
+        if method == 'sharpen':
+            method = 'unsharp_mask'
         intensity = float(data.get('intensity', 50))
             
         # Convert base64 to image

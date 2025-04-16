@@ -21,15 +21,38 @@ class VideoProcessor:
         """Download video from URL using pytube for YouTube and yt-dlp for other platforms"""
         output_path = os.path.join(self.upload_folder, f"{job_id}.mp4")
         
-        # Check if the URL is from YouTube
-        youtube_pattern = r'(?:https?:\/\/)?(?:www\.)?(?:youtube\.com|youtu\.be)\/(?:watch\?v=)?([^\s&]+)'
-        is_youtube_url = re.match(youtube_pattern, video_url) is not None
+        # More comprehensive YouTube URL detection
+        youtube_patterns = [
+            r'(?:youtube\.com\/watch\?v=|youtu\.be\/)([a-zA-Z0-9_-]{11})',
+            r'youtube\.com\/embed\/([a-zA-Z0-9_-]{11})',
+            r'youtube\.com\/v\/([a-zA-Z0-9_-]{11})',
+            r'youtube\.com\/shorts\/([a-zA-Z0-9_-]{11})'
+        ]
+        
+        is_youtube_url = False
+        for pattern in youtube_patterns:
+            if re.search(pattern, video_url):
+                is_youtube_url = True
+                break
+                
+        # Explicit check for standard YouTube URL formats
+        if video_url.startswith(('https://www.youtube.com/watch?v=', 
+                               'https://youtu.be/', 
+                               'http://www.youtube.com/watch?v=',
+                               'http://youtu.be/',
+                               "https://www.youtube.com/shorts/")):
+            is_youtube_url = True
+            
+        print(f"URL: {video_url}")
+        print(f"Is YouTube: {is_youtube_url}")
         
         if is_youtube_url:
             try:
                 print(f"Downloading YouTube video using pytube: {video_url}")
                 # Use pytube for YouTube videos
                 yt = YouTube(video_url)
+                print(f"Video title: {yt.title}")
+                
                 # Get the highest resolution progressive stream (video+audio)
                 stream = yt.streams.filter(progressive=True, file_extension='mp4').order_by('resolution').desc().first()
                 if not stream:
@@ -39,8 +62,11 @@ class VideoProcessor:
                 if not stream:
                     raise Exception("No suitable stream found for this YouTube video.")
                 
+                print(f"Selected stream: {stream.resolution}, {stream.mime_type}")
+                
                 # Download the video
                 stream.download(output_path=os.path.dirname(output_path), filename=f"{job_id}.mp4")
+                print(f"Download complete: {output_path}")
                 return output_path
             except Exception as e:
                 print(f"pytube failed: {e}")
@@ -49,6 +75,7 @@ class VideoProcessor:
         
         # For non-YouTube URLs or if pytube failed, use yt-dlp
         try:
+            print(f"Using yt-dlp for: {video_url}")
             subprocess.run([
                 "python", "-m", "yt_dlp",
                 "--impersonate", "chrome",
@@ -56,6 +83,7 @@ class VideoProcessor:
                 "-o", output_path,
                 video_url
             ], check=True)
+            print(f"yt-dlp download complete: {output_path}")
             return output_path
         except Exception as e:
             print(f"yt-dlp failed: {e}")
