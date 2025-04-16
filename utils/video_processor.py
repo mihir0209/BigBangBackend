@@ -4,11 +4,14 @@ import base64
 import subprocess
 import json
 import requests
+import re
+import time
+import random
 from moviepy.editor import VideoFileClip
 from .text_extractor import TextExtractor
 from .frame_extractor import FrameExtractor
 from pytube import YouTube
-import re
+from urllib.parse import parse_qs, urlparse
 
 class VideoProcessor:
     def __init__(self, upload_folder, results_folder):
@@ -18,7 +21,7 @@ class VideoProcessor:
         self.text_extractor = TextExtractor()
         
     def download_video(self, video_url, job_id):
-        """Download video from URL using pytube for YouTube and yt-dlp for other platforms"""
+        """Download video from URL using multiple methods with fallbacks"""
         output_path = os.path.join(self.upload_folder, f"{job_id}.mp4")
         
         # More comprehensive YouTube URL detection
@@ -30,9 +33,13 @@ class VideoProcessor:
         ]
         
         is_youtube_url = False
+        video_id = None
+        
         for pattern in youtube_patterns:
-            if re.search(pattern, video_url):
+            match = re.search(pattern, video_url)
+            if match:
                 is_youtube_url = True
+                video_id = match.group(1)
                 break
                 
         # Explicit check for standard YouTube URL formats
@@ -42,62 +49,233 @@ class VideoProcessor:
                                'http://youtu.be/',
                                "https://www.youtube.com/shorts/")):
             is_youtube_url = True
+            # Extract video ID from URL if not already done
+            if not video_id:
+                parsed_url = urlparse(video_url)
+                if parsed_url.netloc == 'youtu.be':
+                    video_id = parsed_url.path.lstrip('/')
+                else:
+                    query_params = parse_qs(parsed_url.query)
+                    video_id = query_params.get('v', [None])[0]
             
         print(f"URL: {video_url}")
         print(f"Is YouTube: {is_youtube_url}")
+        print(f"Video ID: {video_id}")
         
-        if is_youtube_url:
+        # List of methods to try
+        methods = [
+            self._download_with_pytube,
+            self._download_with_yt_dlp,
+            self._download_with_direct_request,
+            self._download_with_invidious
+        ]
+        
+        last_error = None
+        
+        # Try each method in order
+        for method in methods:
             try:
-                print(f"Downloading YouTube video using pytube: {video_url}")
-                # Use pytube for YouTube videos
-                yt = YouTube(video_url)
-                print(f"Video title: {yt.title}")
-                
-                # Get the highest resolution progressive stream (video+audio)
-                stream = yt.streams.filter(progressive=True, file_extension='mp4').order_by('resolution').desc().first()
-                if not stream:
-                    # Try adaptive streams if no progressive stream is found
-                    stream = yt.streams.filter(file_extension='mp4').order_by('resolution').desc().first()
-                
-                if not stream:
-                    raise Exception("No suitable stream found for this YouTube video.")
-                
-                print(f"Selected stream: {stream.resolution}, {stream.mime_type}")
-                
-                # Download the video
-                stream.download(output_path=os.path.dirname(output_path), filename=f"{job_id}.mp4")
-                print(f"Download complete: {output_path}")
-                return output_path
+                print(f"Trying download method: {method.__name__}")
+                if is_youtube_url and video_id:
+                    return method(video_url, output_path, video_id)
+                elif method != self._download_with_invidious and method != self._download_with_direct_request:
+                    # Only non-YouTube specific methods for non-YouTube URLs
+                    return method(video_url, output_path)
             except Exception as e:
-                print(f"pytube failed: {e}")
-                # Fall back to yt-dlp if pytube fails
-                print("Falling back to yt-dlp...")
+                print(f"{method.__name__} failed: {e}")
+                last_error = e
+                # Random delay between attempts to avoid triggering rate limits
+                time.sleep(random.uniform(1, 3))
         
-        # For non-YouTube URLs or if pytube failed, use yt-dlp
-        try:
-            print(f"Using yt-dlp for: {video_url}")
-            subprocess.run([
-                "python", "-m", "yt_dlp",
-                "--impersonate", "chrome",
-                "-f", "bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best",
-                "-o", output_path,
-                video_url
-            ], check=True)
-            print(f"yt-dlp download complete: {output_path}")
-            return output_path
-        except Exception as e:
-            print(f"yt-dlp failed: {e}")
-            
-            # Fallback to direct download for direct video URLs
-            if video_url.endswith('.mp4'):
-                print("Attempting direct download...")
+        # If we get here, all methods failed
+        if video_url.endswith('.mp4'):
+            print("Attempting direct download for .mp4 URL...")
+            try:
                 response = requests.get(video_url, stream=True)
                 with open(output_path, 'wb') as f:
                     for chunk in response.iter_content(chunk_size=8192):
                         f.write(chunk)
                 return output_path
+            except Exception as e:
+                print(f"Direct .mp4 download failed: {e}")
+                last_error = e
+        
+        # All methods failed
+        raise Exception(f"All download methods failed. Last error: {last_error}")
+    
+    def _download_with_pytube(self, video_url, output_path, video_id=None):
+        """Download using pytube"""
+        print(f"Downloading YouTube video using pytube: {video_url}")
+        
+        # Add user-agent to avoid detection
+        yt = YouTube(
+            video_url,
+            use_oauth=False,
+            allow_oauth_cache=True
+        )
+        
+        print(f"Video title: {yt.title}")
+        
+        # Try progressive streams first (audio+video combined)
+        stream = yt.streams.filter(progressive=True, file_extension='mp4').order_by('resolution').desc().first()
+        
+        if not stream:
+            # Try adaptive streams if no progressive stream is found
+            stream = yt.streams.filter(file_extension='mp4').order_by('resolution').desc().first()
+        
+        if not stream:
+            raise Exception("No suitable stream found for this YouTube video.")
+        
+        print(f"Selected stream: {stream.resolution}, {stream.mime_type}")
+        
+        # Download the video
+        stream.download(output_path=os.path.dirname(output_path), filename=os.path.basename(output_path))
+        print(f"Download complete: {output_path}")
+        return output_path
+    
+    def _download_with_yt_dlp(self, video_url, output_path, video_id=None):
+        """Download using yt-dlp with multiple user agents"""
+        # Different user agents to try
+        user_agents = [
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/115.0.0.0 Safari/537.36",
+            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.5 Safari/605.1.15",
+            "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/116.0.0.0 Safari/537.36",
+        ]
+        
+        # Try different user agents
+        for user_agent in user_agents:
+            try:
+                print(f"Using yt-dlp with user agent: {user_agent[:30]}...")
+                cmd = [
+                    "python", "-m", "yt_dlp",
+                    "--user-agent", user_agent, 
+                    "--impersonate", "chrome",
+                    "--no-check-certificate",
+                    "-f", "bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best",
+                    "-o", output_path,
+                    video_url
+                ]
+                result = subprocess.run(cmd, check=True, capture_output=True, text=True)
+                print(f"yt-dlp download complete: {output_path}")
+                return output_path
+            except subprocess.CalledProcessError as e:
+                print(f"yt-dlp with user agent {user_agent[:15]}... failed: {e}")
+                print(f"Error output: {e.stderr}")
+                continue
+        
+        # If all user agents failed
+        raise Exception("All yt-dlp download attempts failed")
+    
+    def _download_with_direct_request(self, video_url, output_path, video_id):
+        """Download via direct API request to YouTube"""
+        if not video_id:
+            raise Exception("Video ID required for direct request download")
             
-            raise Exception(f"Failed to download video: {e}")
+        print(f"Attempting direct API request download for video ID: {video_id}")
+        
+        # Try to get video info using YouTube's own API endpoints
+        session = requests.Session()
+        
+        # Add headers to look like a browser
+        session.headers.update({
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/115.0.0.0 Safari/537.36',
+            'Accept-Language': 'en-US,en;q=0.9',
+            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8',
+            'Referer': 'https://www.youtube.com/',
+            'Origin': 'https://www.youtube.com'
+        })
+        
+        # First get the watch page
+        response = session.get(f"https://www.youtube.com/watch?v={video_id}")
+        
+        # Extract the master.m3u8 URL from the page
+        patterns = [
+            r'"(?:hlsManifestUrl|dashManifestUrl)":"([^"]+)"',
+            r'(?:hlsManifestUrl|dashManifestUrl)\":\"([^\"]+)\"'
+        ]
+        
+        for pattern in patterns:
+            matches = re.findall(pattern, response.text)
+            if matches:
+                manifest_url = matches[0].replace('\\/', '/')
+                print(f"Found manifest URL: {manifest_url[:50]}...")
+                
+                # Get the manifest file
+                manifest = session.get(manifest_url).text
+                
+                # Find the highest quality stream URL
+                stream_urls = re.findall(r'https://[^\"\']+', manifest)
+                if stream_urls:
+                    # Take the first URL which is typically the highest quality
+                    stream_url = stream_urls[0]
+                    print(f"Found stream URL: {stream_url[:50]}...")
+                    
+                    # Download the stream
+                    with open(output_path, 'wb') as f:
+                        response = session.get(stream_url, stream=True)
+                        for chunk in response.iter_content(chunk_size=8192):
+                            f.write(chunk)
+                    print(f"Direct download complete: {output_path}")
+                    return output_path
+        
+        raise Exception("Could not find video stream URL in YouTube page")
+    
+    def _download_with_invidious(self, video_url, output_path, video_id):
+        """Download using Invidious instances as proxy"""
+        if not video_id:
+            raise Exception("Video ID required for Invidious download")
+            
+        # List of public Invidious instances
+        instances = [
+            "https://invidious.snopyta.org",
+            "https://invidious.kavin.rocks",
+            "https://vid.puffyan.us",
+            "https://invidious.namazso.eu"
+        ]
+        
+        for instance in instances:
+            try:
+                print(f"Trying Invidious instance: {instance}")
+                # Get video info from Invidious API
+                api_url = f"{instance}/api/v1/videos/{video_id}"
+                response = requests.get(api_url, timeout=10)
+                
+                if response.status_code != 200:
+                    print(f"Instance {instance} returned status {response.status_code}")
+                    continue
+                
+                video_data = response.json()
+                
+                # Find the highest quality format
+                formats = video_data.get('formatStreams', [])
+                if not formats:
+                    print(f"No format streams found on {instance}")
+                    continue
+                
+                # Sort by quality (assuming higher resolution = higher quality)
+                formats.sort(key=lambda x: int(x.get('quality', '0').replace('p', '')), reverse=True)
+                best_format = formats[0]
+                
+                # Download the video
+                url = best_format.get('url')
+                if not url:
+                    print(f"No URL found in best format on {instance}")
+                    continue
+                
+                print(f"Downloading from {instance}, quality: {best_format.get('quality')}")
+                response = requests.get(url, stream=True)
+                
+                with open(output_path, 'wb') as f:
+                    for chunk in response.iter_content(chunk_size=8192):
+                        f.write(chunk)
+                
+                print(f"Invidious download complete: {output_path}")
+                return output_path
+            except Exception as e:
+                print(f"Invidious instance {instance} failed: {e}")
+                continue
+        
+        raise Exception("All Invidious instances failed")
     
     def extract_frames_and_text(self, video_path, job_id):
         """Extract frames from video and perform OCR on them"""
