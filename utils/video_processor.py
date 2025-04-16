@@ -7,6 +7,8 @@ import requests
 from moviepy.editor import VideoFileClip
 from .text_extractor import TextExtractor
 from .frame_extractor import FrameExtractor
+from pytube import YouTube
+import re
 
 class VideoProcessor:
     def __init__(self, upload_folder, results_folder):
@@ -16,23 +18,51 @@ class VideoProcessor:
         self.text_extractor = TextExtractor()
         
     def download_video(self, video_url, job_id):
-        """Download video from URL using yt-dlp for various platforms"""
+        """Download video from URL using pytube for YouTube and yt-dlp for other platforms"""
         output_path = os.path.join(self.upload_folder, f"{job_id}.mp4")
         
+        # Check if the URL is from YouTube
+        youtube_pattern = r'(?:https?:\/\/)?(?:www\.)?(?:youtube\.com|youtu\.be)\/(?:watch\?v=)?([^\s&]+)'
+        is_youtube_url = re.match(youtube_pattern, video_url) is not None
+        
+        if is_youtube_url:
+            try:
+                print(f"Downloading YouTube video using pytube: {video_url}")
+                # Use pytube for YouTube videos
+                yt = YouTube(video_url)
+                # Get the highest resolution progressive stream (video+audio)
+                stream = yt.streams.filter(progressive=True, file_extension='mp4').order_by('resolution').desc().first()
+                if not stream:
+                    # Try adaptive streams if no progressive stream is found
+                    stream = yt.streams.filter(file_extension='mp4').order_by('resolution').desc().first()
+                
+                if not stream:
+                    raise Exception("No suitable stream found for this YouTube video.")
+                
+                # Download the video
+                stream.download(output_path=os.path.dirname(output_path), filename=f"{job_id}.mp4")
+                return output_path
+            except Exception as e:
+                print(f"pytube failed: {e}")
+                # Fall back to yt-dlp if pytube fails
+                print("Falling back to yt-dlp...")
+        
+        # For non-YouTube URLs or if pytube failed, use yt-dlp
         try:
             subprocess.run([
                 "python", "-m", "yt_dlp",
                 "--impersonate", "chrome",
                 "-f", "bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best",
-                "-o", f"uploads\\{job_id}.mp4",
+                "-o", output_path,
                 video_url
             ], check=True)
-            return f"uploads\\{job_id}.mp4"
+            return output_path
         except Exception as e:
             print(f"yt-dlp failed: {e}")
             
             # Fallback to direct download for direct video URLs
             if video_url.endswith('.mp4'):
+                print("Attempting direct download...")
                 response = requests.get(video_url, stream=True)
                 with open(output_path, 'wb') as f:
                     for chunk in response.iter_content(chunk_size=8192):
