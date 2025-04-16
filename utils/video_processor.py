@@ -7,6 +7,7 @@ import requests
 import re
 import time
 import random
+import platform
 from moviepy.editor import VideoFileClip
 from .text_extractor import TextExtractor
 from .frame_extractor import FrameExtractor
@@ -19,6 +20,8 @@ class VideoProcessor:
         self.results_folder = results_folder
         self.frame_extractor = FrameExtractor()
         self.text_extractor = TextExtractor()
+        # Detect if running on Render or local
+        self.is_render = 'RENDER' in os.environ or platform.system() != 'Windows'
         
     def download_video(self, video_url, job_id):
         """Download video from URL using multiple methods with fallbacks"""
@@ -61,14 +64,25 @@ class VideoProcessor:
         print(f"URL: {video_url}")
         print(f"Is YouTube: {is_youtube_url}")
         print(f"Video ID: {video_id}")
+        print(f"Running on Render: {self.is_render}")
         
-        # List of methods to try
-        methods = [
-            self._download_with_pytube,
-            self._download_with_yt_dlp,
-            self._download_with_direct_request,
-            self._download_with_invidious
-        ]
+        # Different method ordering based on environment
+        if self.is_render and is_youtube_url:
+            # On Render, prioritize methods that are less likely to be detected as bots
+            methods = [
+                self._download_with_invidious,
+                self._download_with_direct_request,
+                self._download_with_pytube_advanced, # New method with more browser simulation
+                self._download_with_yt_dlp_advanced  # Enhanced yt-dlp with more options
+            ]
+        else:
+            # On local PC, use the most direct methods first
+            methods = [
+                self._download_with_pytube,
+                self._download_with_yt_dlp,
+                self._download_with_direct_request,
+                self._download_with_invidious
+            ]
         
         last_error = None
         
@@ -133,6 +147,77 @@ class VideoProcessor:
         print(f"Download complete: {output_path}")
         return output_path
     
+    def _download_with_pytube_advanced(self, video_url, output_path, video_id=None):
+        """Download using pytube with advanced anti-detection measures"""
+        print(f"Downloading YouTube video using pytube advanced: {video_url}")
+        
+        # Rotate user agents to appear like different browsers
+        user_agents = [
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
+            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.3 Safari/605.1.15",
+            "Mozilla/5.0 (X11; Ubuntu; Linux x86_64; rv:124.0) Gecko/20100101 Firefox/124.0",
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:123.0) Gecko/20100101 Firefox/123.0",
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36 Edg/122.0.2365.92",
+        ]
+        
+        # Add random delay to mimic human behavior
+        time.sleep(random.uniform(1, 3))
+        
+        user_agent = random.choice(user_agents)
+        
+        # Use the pytube-related-API
+        # When on Render, try to fetch using a more complex approach
+        try:
+            from pytube import YouTube
+            
+            # Create a YouTube object with a random user agent
+            yt = YouTube(
+                url=video_url,
+                use_oauth=False,
+                allow_oauth_cache=True
+            )
+            
+            # Explicitly set the user agent on the innertube client
+            if hasattr(yt, '_innertube_client') and hasattr(yt._innertube_client, '_headers'):
+                yt._innertube_client._headers['User-Agent'] = user_agent
+            
+            # Also set the user agent on the session object
+            if hasattr(yt, '_http'):
+                yt._http.headers['User-Agent'] = user_agent
+            
+            print(f"Video title: {yt.title}")
+            
+            # Add another small delay to mimic human waiting for video info
+            time.sleep(random.uniform(0.5, 1.5))
+            
+            # Try different stream types
+            # First try progressive
+            stream = yt.streams.filter(progressive=True, file_extension='mp4').order_by('resolution').desc().first()
+            
+            if not stream:
+                # Then try adaptive
+                stream = yt.streams.filter(file_extension='mp4').order_by('resolution').desc().first()
+            
+            if not stream:
+                # Then try any format
+                stream = yt.streams.order_by('resolution').desc().first()
+            
+            if not stream:
+                raise Exception("No suitable stream found for this YouTube video.")
+            
+            print(f"Selected stream: {stream.resolution}, {stream.mime_type}")
+            
+            # Small delay before download
+            time.sleep(random.uniform(0.5, 2))
+            
+            # Download the video
+            stream.download(output_path=os.path.dirname(output_path), filename=os.path.basename(output_path))
+            print(f"Download complete: {output_path}")
+            return output_path
+        except Exception as e:
+            print(f"Advanced pytube download failed: {e}")
+            raise
+    
     def _download_with_yt_dlp(self, video_url, output_path, video_id=None):
         """Download using yt-dlp with multiple user agents"""
         # Different user agents to try
@@ -165,6 +250,55 @@ class VideoProcessor:
         
         # If all user agents failed
         raise Exception("All yt-dlp download attempts failed")
+        
+    def _download_with_yt_dlp_advanced(self, video_url, output_path, video_id=None):
+        """Download using yt-dlp with advanced anti-detection options"""
+        user_agents = [
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
+            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.3 Safari/605.1.15",
+            "Mozilla/5.0 (X11; Ubuntu; Linux x86_64; rv:124.0) Gecko/20100101 Firefox/124.0",
+        ]
+        
+        # Browser types to impersonate
+        browsers = ["chrome", "firefox", "safari"]
+        
+        # Try different approaches
+        for user_agent in user_agents:
+            for browser in browsers:
+                try:
+                    print(f"Using yt-dlp advanced with {browser} and custom agent...")
+                    
+                    # Random sleep to make it look more human
+                    time.sleep(random.uniform(1, 4))
+                    
+                    cmd = [
+                        "python", "-m", "yt_dlp",
+                        "--user-agent", user_agent,
+                        "--impersonate", browser,
+                        "--no-check-certificate",
+                        "--geo-verification-proxy", "", # Try without geo verification
+                        "--add-header", f"Referer:https://www.youtube.com/watch?v={video_id}",
+                        "--add-header", "Origin:https://www.youtube.com",
+                        "--add-header", "Accept-Language:en-US,en;q=0.9",
+                        "--sleep-requests", "1",
+                        "--sleep-interval", "1", 
+                        "--max-sleep-interval", "5",
+                        "-f", "bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best",
+                        "-o", output_path,
+                        video_url
+                    ]
+                    
+                    result = subprocess.run(cmd, check=True, capture_output=True, text=True)
+                    print(f"yt-dlp advanced download complete: {output_path}")
+                    return output_path
+                except subprocess.CalledProcessError as e:
+                    print(f"yt-dlp advanced with {browser} failed: {e}")
+                    if hasattr(e, 'stderr'):
+                        print(f"Error output: {e.stderr}")
+                    continue
+        
+        # If all attempts failed
+        raise Exception("All yt-dlp advanced download attempts failed")
     
     def _download_with_direct_request(self, video_url, output_path, video_id):
         """Download via direct API request to YouTube"""
@@ -225,20 +359,41 @@ class VideoProcessor:
         if not video_id:
             raise Exception("Video ID required for Invidious download")
             
-        # List of public Invidious instances
+        # List of public Invidious instances - updated list with more reliable instances
         instances = [
+            "https://yt.artemislena.eu",
+            "https://invidious.flokinet.to",
+            "https://invidious.projectsegfau.lt",
+            "https://invidious.dhusch.de",
             "https://invidious.snopyta.org",
             "https://invidious.kavin.rocks",
             "https://vid.puffyan.us",
-            "https://invidious.namazso.eu"
+            "https://invidious.namazso.eu",
+            "https://yewtu.be"
         ]
+        
+        # Shuffle the list to distribute load and avoid detection patterns
+        random.shuffle(instances)
         
         for instance in instances:
             try:
                 print(f"Trying Invidious instance: {instance}")
+                
+                # Random delay to avoid detection
+                time.sleep(random.uniform(1, 3))
+                
                 # Get video info from Invidious API
                 api_url = f"{instance}/api/v1/videos/{video_id}"
-                response = requests.get(api_url, timeout=10)
+                
+                # Add headers to look like a browser
+                headers = {
+                    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
+                    'Accept-Language': 'en-US,en;q=0.9',
+                    'Accept': 'application/json',
+                    'Referer': f"{instance}/watch?v={video_id}"
+                }
+                
+                response = requests.get(api_url, headers=headers, timeout=15)
                 
                 if response.status_code != 200:
                     print(f"Instance {instance} returned status {response.status_code}")
@@ -263,7 +418,15 @@ class VideoProcessor:
                     continue
                 
                 print(f"Downloading from {instance}, quality: {best_format.get('quality')}")
-                response = requests.get(url, stream=True)
+                
+                # Add another small delay before download
+                time.sleep(random.uniform(0.5, 2))
+                
+                # Download with a normal browser-like session
+                session = requests.Session()
+                session.headers.update(headers)
+                
+                response = session.get(url, stream=True)
                 
                 with open(output_path, 'wb') as f:
                     for chunk in response.iter_content(chunk_size=8192):
