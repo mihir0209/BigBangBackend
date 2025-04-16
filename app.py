@@ -1,4 +1,3 @@
-from flask import Flask, request, jsonify
 from flask_cors import CORS
 import cv2
 import numpy as np
@@ -58,9 +57,6 @@ def enhance_image():
             'message': str(e)
         }), 500
 
-
-app = Flask(__name__)
-CORS(app)  # Enable CORS for all routes
 
 # Configuration
 UPLOAD_FOLDER = 'uploads'
