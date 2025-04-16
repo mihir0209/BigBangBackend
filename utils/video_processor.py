@@ -8,6 +8,8 @@ import re
 import time
 import random
 import platform
+import threading
+import concurrent.futures
 from moviepy.editor import VideoFileClip
 from .text_extractor import TextExtractor
 from .frame_extractor import FrameExtractor
@@ -22,10 +24,20 @@ class VideoProcessor:
         self.text_extractor = TextExtractor()
         # Detect if running on Render or local
         self.is_render = 'RENDER' in os.environ or platform.system() != 'Windows'
+        # Timeouts for different methods (in seconds)
+        self.timeouts = {
+            'invidious': 10, 
+            'direct_request': 15,
+            'pytube': 25,
+            'yt_dlp': 40
+        }
         
     def download_video(self, video_url, job_id):
         """Download video from URL using multiple methods with fallbacks"""
         output_path = os.path.join(self.upload_folder, f"{job_id}.mp4")
+        
+        # Create uploads directory if it doesn't exist
+        os.makedirs(os.path.dirname(output_path), exist_ok=True)
         
         # More comprehensive YouTube URL detection
         youtube_patterns = [
@@ -47,16 +59,18 @@ class VideoProcessor:
                 
         # Explicit check for standard YouTube URL formats
         if video_url.startswith(('https://www.youtube.com/watch?v=', 
-                               'https://youtu.be/', 
-                               'http://www.youtube.com/watch?v=',
-                               'http://youtu.be/',
-                               "https://www.youtube.com/shorts/")):
+                                'https://youtu.be/', 
+                                'http://www.youtube.com/watch?v=',
+                                'http://youtu.be/',
+                                "https://www.youtube.com/shorts/")):
             is_youtube_url = True
             # Extract video ID from URL if not already done
             if not video_id:
                 parsed_url = urlparse(video_url)
                 if parsed_url.netloc == 'youtu.be':
                     video_id = parsed_url.path.lstrip('/')
+                elif 'shorts' in parsed_url.path:
+                    video_id = parsed_url.path.split('/')[-1]
                 else:
                     query_params = parse_qs(parsed_url.query)
                     video_id = query_params.get('v', [None])[0]
@@ -66,57 +80,132 @@ class VideoProcessor:
         print(f"Video ID: {video_id}")
         print(f"Running on Render: {self.is_render}")
         
-        # Different method ordering based on environment
-        if self.is_render and is_youtube_url:
-            # On Render, prioritize methods that are less likely to be detected as bots
-            methods = [
-                self._download_with_invidious,
-                self._download_with_direct_request,
-                self._download_with_pytube_advanced, # New method with more browser simulation
-                self._download_with_yt_dlp_advanced  # Enhanced yt-dlp with more options
-            ]
-        else:
-            # On local PC, use the most direct methods first
-            methods = [
-                self._download_with_pytube,
-                self._download_with_yt_dlp,
-                self._download_with_direct_request,
-                self._download_with_invidious
-            ]
+        # For testing on render, we'll try to directly download from any available source
+        # This is an optimization to avoid timeouts by:
+        # 1. Trying faster methods first
+        # 2. Running methods concurrently when possible
+        # 3. Setting timeouts on slow methods
         
-        last_error = None
-        
-        # Try each method in order
-        for method in methods:
+        if not is_youtube_url:
+            # Non-YouTube video - try direct download or yt-dlp
             try:
-                print(f"Trying download method: {method.__name__}")
-                if is_youtube_url and video_id:
-                    return method(video_url, output_path, video_id)
-                elif method != self._download_with_invidious and method != self._download_with_direct_request:
-                    # Only non-YouTube specific methods for non-YouTube URLs
-                    return method(video_url, output_path)
+                return self._download_with_yt_dlp(video_url, output_path)
             except Exception as e:
-                print(f"{method.__name__} failed: {e}")
-                last_error = e
-                # Random delay between attempts to avoid triggering rate limits
-                time.sleep(random.uniform(1, 3))
+                print(f"yt-dlp failed: {e}")
+                if video_url.endswith('.mp4'):
+                    return self._direct_download(video_url, output_path)
+                raise Exception(f"Failed to download non-YouTube video: {e}")
+
+        # For YouTube videos, try to download using multiple methods concurrently
+        results = []
+        errors = []
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=3) as executor:
+            # First try the invidious approach with timeout
+            print("Starting Invidious download attempt...")
+            future_invidious = executor.submit(self._try_with_timeout, 
+                                              self._download_with_invidious, 
+                                              self.timeouts['invidious'],
+                                              video_url, output_path, video_id)
+            
+            # Brief delay before starting other methods to allow invidious to succeed if it's fast
+            time.sleep(0.5)
+            
+            # Then try pytube
+            print("Starting pytube download attempt...")
+            future_pytube = executor.submit(self._try_with_timeout,
+                                          self._download_with_pytube_advanced,
+                                          self.timeouts['pytube'],
+                                          video_url, output_path, video_id)
+            
+            # Brief delay before launching yt-dlp
+            time.sleep(0.5)
+            
+            # Finally try yt-dlp (can be slow)
+            print("Starting yt-dlp download attempt...")
+            future_yt_dlp = executor.submit(self._try_with_timeout,
+                                          self._download_with_yt_dlp_advanced,
+                                          self.timeouts['yt_dlp'],
+                                          video_url, output_path, video_id)
+            
+            # Wait for the first successful result or until all futures complete
+            for future in concurrent.futures.as_completed([future_invidious, future_pytube, future_yt_dlp]):
+                try:
+                    result = future.result()
+                    if result:
+                        print(f"Download successful: {result}")
+                        # Cancel remaining futures to avoid unnecessary processing
+                        for f in [future_invidious, future_pytube, future_yt_dlp]:
+                            if not f.done():
+                                f.cancel()
+                        return result
+                except Exception as e:
+                    print(f"Download method failed: {str(e)}")
+                    errors.append(str(e))
+                    continue
         
-        # If we get here, all methods failed
+        # If all concurrent methods failed, try direct request as a last resort
+        try:
+            print("Trying direct request as last resort...")
+            return self._try_with_timeout(self._download_with_direct_request, 
+                                         self.timeouts['direct_request'],
+                                         video_url, output_path, video_id)
+        except Exception as e:
+            print(f"Direct request failed: {e}")
+            errors.append(str(e))
+        
+        # Finally, try direct download if it's an MP4
         if video_url.endswith('.mp4'):
-            print("Attempting direct download for .mp4 URL...")
             try:
-                response = requests.get(video_url, stream=True)
-                with open(output_path, 'wb') as f:
-                    for chunk in response.iter_content(chunk_size=8192):
-                        f.write(chunk)
-                return output_path
+                print("Attempting direct download for .mp4 URL...")
+                return self._direct_download(video_url, output_path)
             except Exception as e:
                 print(f"Direct .mp4 download failed: {e}")
-                last_error = e
+                errors.append(str(e))
         
         # All methods failed
-        raise Exception(f"All download methods failed. Last error: {last_error}")
+        raise Exception(f"All download methods failed. Errors: {', '.join(errors)}")
     
+    def _try_with_timeout(self, func, timeout, *args, **kwargs):
+        """Run a function with a timeout"""
+        result = [None]
+        error = [None]
+        
+        def run_func():
+            try:
+                result[0] = func(*args, **kwargs)
+            except Exception as e:
+                error[0] = e
+        
+        thread = threading.Thread(target=run_func)
+        thread.start()
+        thread.join(timeout)
+        
+        if thread.is_alive():
+            print(f"Function {func.__name__} timed out after {timeout} seconds")
+            # Let the thread continue to run in the background
+            # This is needed because some functions might be writing to the output file
+            # but we don't want to wait for them to complete
+            return None
+        
+        if error[0]:
+            raise error[0]
+        
+        return result[0]
+        
+    def _direct_download(self, url, output_path):
+        """Perform a direct download from a URL"""
+        print(f"Directly downloading from URL: {url}")
+        response = requests.get(url, stream=True, timeout=30)
+        response.raise_for_status()
+        
+        with open(output_path, 'wb') as f:
+            for chunk in response.iter_content(chunk_size=8192):
+                f.write(chunk)
+        
+        print(f"Direct download complete: {output_path}")
+        return output_path
+        
     def _download_with_pytube(self, video_url, output_path, video_id=None):
         """Download using pytube"""
         print(f"Downloading YouTube video using pytube: {video_url}")
@@ -160,9 +249,6 @@ class VideoProcessor:
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36 Edg/122.0.2365.92",
         ]
         
-        # Add random delay to mimic human behavior
-        time.sleep(random.uniform(1, 3))
-        
         user_agent = random.choice(user_agents)
         
         # Use the pytube-related-API
@@ -188,7 +274,7 @@ class VideoProcessor:
             print(f"Video title: {yt.title}")
             
             # Add another small delay to mimic human waiting for video info
-            time.sleep(random.uniform(0.5, 1.5))
+            time.sleep(random.uniform(0.5, 1.0))
             
             # Try different stream types
             # First try progressive
@@ -206,9 +292,6 @@ class VideoProcessor:
                 raise Exception("No suitable stream found for this YouTube video.")
             
             print(f"Selected stream: {stream.resolution}, {stream.mime_type}")
-            
-            # Small delay before download
-            time.sleep(random.uniform(0.5, 2))
             
             # Download the video
             stream.download(output_path=os.path.dirname(output_path), filename=os.path.basename(output_path))
@@ -240,12 +323,16 @@ class VideoProcessor:
                     "-o", output_path,
                     video_url
                 ]
-                result = subprocess.run(cmd, check=True, capture_output=True, text=True)
+                result = subprocess.run(cmd, check=True, capture_output=True, text=True, timeout=20)
                 print(f"yt-dlp download complete: {output_path}")
                 return output_path
+            except subprocess.TimeoutExpired:
+                print("yt-dlp process timed out")
+                continue
             except subprocess.CalledProcessError as e:
                 print(f"yt-dlp with user agent {user_agent[:15]}... failed: {e}")
-                print(f"Error output: {e.stderr}")
+                if hasattr(e, 'stderr'):
+                    print(f"Error output: {e.stderr}")
                 continue
         
         # If all user agents failed
@@ -268,9 +355,6 @@ class VideoProcessor:
                 try:
                     print(f"Using yt-dlp advanced with {browser} and custom agent...")
                     
-                    # Random sleep to make it look more human
-                    time.sleep(random.uniform(1, 4))
-                    
                     cmd = [
                         "python", "-m", "yt_dlp",
                         "--user-agent", user_agent,
@@ -280,17 +364,21 @@ class VideoProcessor:
                         "--add-header", f"Referer:https://www.youtube.com/watch?v={video_id}",
                         "--add-header", "Origin:https://www.youtube.com",
                         "--add-header", "Accept-Language:en-US,en;q=0.9",
-                        "--sleep-requests", "1",
-                        "--sleep-interval", "1", 
-                        "--max-sleep-interval", "5",
+                        # Reduce sleeps to speed up the process
+                        "--sleep-requests", "0.5",
+                        "--sleep-interval", "0.5", 
+                        "--max-sleep-interval", "1",
                         "-f", "bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best",
                         "-o", output_path,
                         video_url
                     ]
                     
-                    result = subprocess.run(cmd, check=True, capture_output=True, text=True)
+                    result = subprocess.run(cmd, check=True, capture_output=True, text=True, timeout=20)
                     print(f"yt-dlp advanced download complete: {output_path}")
                     return output_path
+                except subprocess.TimeoutExpired:
+                    print(f"yt-dlp process with {browser} timed out")
+                    continue
                 except subprocess.CalledProcessError as e:
                     print(f"yt-dlp advanced with {browser} failed: {e}")
                     if hasattr(e, 'stderr'):
@@ -319,8 +407,8 @@ class VideoProcessor:
             'Origin': 'https://www.youtube.com'
         })
         
-        # First get the watch page
-        response = session.get(f"https://www.youtube.com/watch?v={video_id}")
+        # First get the watch page with a timeout
+        response = session.get(f"https://www.youtube.com/watch?v={video_id}", timeout=10)
         
         # Extract the master.m3u8 URL from the page
         patterns = [
@@ -334,8 +422,8 @@ class VideoProcessor:
                 manifest_url = matches[0].replace('\\/', '/')
                 print(f"Found manifest URL: {manifest_url[:50]}...")
                 
-                # Get the manifest file
-                manifest = session.get(manifest_url).text
+                # Get the manifest file with a timeout
+                manifest = session.get(manifest_url, timeout=10).text
                 
                 # Find the highest quality stream URL
                 stream_urls = re.findall(r'https://[^\"\']+', manifest)
@@ -344,9 +432,9 @@ class VideoProcessor:
                     stream_url = stream_urls[0]
                     print(f"Found stream URL: {stream_url[:50]}...")
                     
-                    # Download the stream
+                    # Download the stream with a timeout
                     with open(output_path, 'wb') as f:
-                        response = session.get(stream_url, stream=True)
+                        response = session.get(stream_url, stream=True, timeout=10)
                         for chunk in response.iter_content(chunk_size=8192):
                             f.write(chunk)
                     print(f"Direct download complete: {output_path}")
@@ -361,15 +449,13 @@ class VideoProcessor:
             
         # List of public Invidious instances - updated list with more reliable instances
         instances = [
-            "https://yt.artemislena.eu",
-            "https://invidious.flokinet.to",
-            "https://invidious.projectsegfau.lt",
-            "https://invidious.dhusch.de",
+            "https://vid.puffyan.us",
             "https://invidious.snopyta.org",
             "https://invidious.kavin.rocks",
-            "https://vid.puffyan.us",
-            "https://invidious.namazso.eu",
-            "https://yewtu.be"
+            "https://yewtu.be",
+            "https://yt.artemislena.eu",
+            "https://invidious.flokinet.to",
+            "https://invidious.projectsegfau.lt"
         ]
         
         # Shuffle the list to distribute load and avoid detection patterns
@@ -379,10 +465,7 @@ class VideoProcessor:
             try:
                 print(f"Trying Invidious instance: {instance}")
                 
-                # Random delay to avoid detection
-                time.sleep(random.uniform(1, 3))
-                
-                # Get video info from Invidious API
+                # Get video info from Invidious API with a short timeout
                 api_url = f"{instance}/api/v1/videos/{video_id}"
                 
                 # Add headers to look like a browser
@@ -393,7 +476,7 @@ class VideoProcessor:
                     'Referer': f"{instance}/watch?v={video_id}"
                 }
                 
-                response = requests.get(api_url, headers=headers, timeout=15)
+                response = requests.get(api_url, headers=headers, timeout=5)
                 
                 if response.status_code != 200:
                     print(f"Instance {instance} returned status {response.status_code}")
@@ -419,14 +502,11 @@ class VideoProcessor:
                 
                 print(f"Downloading from {instance}, quality: {best_format.get('quality')}")
                 
-                # Add another small delay before download
-                time.sleep(random.uniform(0.5, 2))
-                
-                # Download with a normal browser-like session
+                # Download with a normal browser-like session and a timeout
                 session = requests.Session()
                 session.headers.update(headers)
                 
-                response = session.get(url, stream=True)
+                response = session.get(url, stream=True, timeout=10)
                 
                 with open(output_path, 'wb') as f:
                     for chunk in response.iter_content(chunk_size=8192):
